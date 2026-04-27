@@ -36,6 +36,11 @@ import yt_dlp
 API_BASE_URL = os.environ.get("API_BASE_URL", "").rstrip("/")
 CLIENT_ID = os.environ.get("CLIENT_ID") or ("client-" + uuid.uuid4().hex[:12])
 VAST_INSTANCE_ID = os.environ.get("VAST_INSTANCE_ID", "")
+# Optional: HTTPS or s3:// URL to a Netscape-format cookies.txt file. When
+# set, the file is fetched on startup and handed to yt-dlp, which lets us
+# download from IP ranges where YouTube triggers the bot/login challenge.
+COOKIES_URL = os.environ.get("COOKIES_URL", "").strip()
+COOKIES_FILE = "/tmp/yt_cookies.txt"
 
 LOG = logging.getLogger("client")
 logging.basicConfig(level=logging.INFO,
@@ -68,6 +73,27 @@ def _get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
 def register():
     LOG.info(f"Registering as {CLIENT_ID} (vast={VAST_INSTANCE_ID})")
     return _post("/register", {"instance_id": VAST_INSTANCE_ID or None})
+
+
+def fetch_cookies():
+    """If COOKIES_URL is set, fetch the cookies.txt and tell yt-dlp to use it."""
+    if not COOKIES_URL:
+        return
+    try:
+        if COOKIES_URL.startswith("s3://"):
+            no_scheme = COOKIES_URL[5:]
+            bucket, _, key = no_scheme.partition("/")
+            s3 = s3_client()
+            s3.download_file(bucket, key, COOKIES_FILE)
+        else:
+            r = requests.get(COOKIES_URL, timeout=30)
+            r.raise_for_status()
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(r.content)
+        YDL_COMMON["cookiefile"] = COOKIES_FILE
+        LOG.info(f"loaded cookies from {COOKIES_URL}")
+    except Exception as e:
+        LOG.warning(f"could not load cookies from {COOKIES_URL}: {e}")
 
 
 def fetch_config():
@@ -350,6 +376,7 @@ def run():
         LOG.error("Could not register with orchestrator — exiting")
         sys.exit(2)
 
+    fetch_cookies()
     s3 = s3_client()
     consecutive_failures = 0
     stop_hb = threading.Event()
