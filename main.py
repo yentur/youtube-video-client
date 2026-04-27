@@ -158,19 +158,21 @@ YDL_COMMON = {
     "no_warnings": True,
     "noplaylist": True,
     "no_check_certificate": True,
-    # Cycle through clients that don't trip the "are you a bot" check on
-    # cloud IPs. tv_simply + web_safari + ios is the most reliable combo
-    # as of late-2025 yt-dlp builds.
+    # `mweb` + `tv` are the two clients that most reliably hand out playable
+    # stream URLs without a po_token on cloud IPs. `missing_pot` tells yt-dlp
+    # to keep formats even when the proof-of-origin token isn't available.
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv_simply", "web_safari", "ios", "android_vr"],
+            "player_client": ["mweb", "tv", "web_safari", "ios"],
+            "formats": "missing_pot",
         },
     },
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                      "Version/17.0 Safari/605.1.15",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+                      "Mobile/15E148 Safari/604.1",
     },
+    "geo_bypass": True,
 }
 
 

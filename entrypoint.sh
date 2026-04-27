@@ -32,7 +32,9 @@ uv pip install -r requirements.txt
 ATTEMPTS=0
 while [ "$ATTEMPTS" -lt 50 ]; do
   ATTEMPTS=$((ATTEMPTS+1))
-  echo "[entrypoint] attempt $ATTEMPTS — launching client"
+  echo "[entrypoint] attempt $ATTEMPTS — pulling latest + launching client"
+  git pull --quiet 2>&1 || true
+  uv pip install --quiet -r requirements.txt 2>&1 | tail -1 || true
   python main.py || true
   echo "[entrypoint] client exited; sleeping 5s before retry"
   sleep 5
