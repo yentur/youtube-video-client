@@ -1,22 +1,25 @@
-"""YouTube downloader client for the vast-dataset orchestrator.
+"""YouTube downloader client — concurrent batch worker.
 
 Behaviour:
   - register with main API
-  - loop: get-next-video → download audio (+ subtitle if available) → S3 → notify
-  - 5 retries on the same video before giving up
-  - if 3 different videos fail consecutively, ask the orchestrator to shut us
-    down (which will destroy the Vast instance)
-  - skip if the file is already in S3
-  - heartbeat the API while working
+  - fetch S3 creds + worker count
+  - main loop:
+      * top up an in-memory queue from /get-next-video-batch
+      * N worker threads pop one video, download (audio + sub if any),
+        upload to S3, post completion individually
+  - 5 retries per video before reporting error
+  - server decides when to shut us down (returns shutdown=True)
 
 Env vars:
-  API_BASE_URL      — orchestrator URL, e.g. http://1.2.3.4:8765
+  API_BASE_URL      — orchestrator URL (e.g. http://1.2.3.4:8765)
   CLIENT_ID         — stable client id (matches orchestrator slot)
-  VAST_INSTANCE_ID  — vast container label (best-effort, optional)
+  VAST_INSTANCE_ID  — Vast container label, optional
+  CLIENT_WORKERS    — concurrent download workers (default 4)
+  COOKIES_URL       — optional: HTTPS or s3:// cookies.txt for yt-dlp
 """
-import json
 import logging
 import os
+import queue
 import random
 import shutil
 import sys
@@ -36,158 +39,34 @@ import yt_dlp
 API_BASE_URL = os.environ.get("API_BASE_URL", "").rstrip("/")
 CLIENT_ID = os.environ.get("CLIENT_ID") or ("client-" + uuid.uuid4().hex[:12])
 VAST_INSTANCE_ID = os.environ.get("VAST_INSTANCE_ID", "")
-# Optional: HTTPS or s3:// URL to a Netscape-format cookies.txt file. When
-# set, the file is fetched on startup and handed to yt-dlp, which lets us
-# download from IP ranges where YouTube triggers the bot/login challenge.
 COOKIES_URL = os.environ.get("COOKIES_URL", "").strip()
 COOKIES_FILE = "/tmp/yt_cookies.txt"
 
 LOG = logging.getLogger("client")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s",
+    stream=sys.stdout,
+)
 
 S3 = {
     "access_key_id": None, "secret_access_key": None, "region": None,
     "bucket": None, "prefix": "",
 }
-LIMITS = {"max_retries_same_video": 5, "max_consecutive_failures": 3}
+LIMITS = {
+    "max_retries_same_video": 5,
+    "max_consecutive_failures": 1,
+    "client_workers": int(os.environ.get("CLIENT_WORKERS", "4") or 4),
+    "client_batch_size": 8,
+}
 
 
-# ---------- API helpers ----------
-def _post(path: str, json_body: dict, timeout: int = 30) -> dict:
-    url = f"{API_BASE_URL}{path}"
-    r = requests.post(url, json=json_body, timeout=timeout,
-                      headers={"X-Client-Id": CLIENT_ID})
-    r.raise_for_status()
-    return r.json()
-
-
-def _get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
-    url = f"{API_BASE_URL}{path}"
-    r = requests.get(url, params=params or {}, timeout=timeout,
-                     headers={"X-Client-Id": CLIENT_ID})
-    r.raise_for_status()
-    return r.json()
-
-
-def register():
-    LOG.info(f"Registering as {CLIENT_ID} (vast={VAST_INSTANCE_ID})")
-    return _post("/register", {"instance_id": VAST_INSTANCE_ID or None})
-
-
-def fetch_cookies():
-    """If COOKIES_URL is set, fetch the cookies.txt and tell yt-dlp to use it."""
-    if not COOKIES_URL:
-        return
-    try:
-        if COOKIES_URL.startswith("s3://"):
-            no_scheme = COOKIES_URL[5:]
-            bucket, _, key = no_scheme.partition("/")
-            s3 = s3_client()
-            s3.download_file(bucket, key, COOKIES_FILE)
-        else:
-            r = requests.get(COOKIES_URL, timeout=30)
-            r.raise_for_status()
-            with open(COOKIES_FILE, "wb") as f:
-                f.write(r.content)
-        YDL_COMMON["cookiefile"] = COOKIES_FILE
-        LOG.info(f"loaded cookies from {COOKIES_URL}")
-    except Exception as e:
-        LOG.warning(f"could not load cookies from {COOKIES_URL}: {e}")
-
-
-def fetch_config():
-    LOG.info("Fetching config from orchestrator")
-    data = _get("/get-config")
-    cfg = data["config"]
-    aws = cfg["aws"]
-    S3.update({
-        "access_key_id": aws["access_key_id"],
-        "secret_access_key": aws["secret_access_key"],
-        "region": aws["region"],
-        "bucket": aws["s3_bucket"],
-        "prefix": aws.get("s3_prefix", ""),
-    })
-    LIMITS.update(cfg.get("limits", {}))
-    LOG.info(f"S3 bucket={S3['bucket']} region={S3['region']}")
-
-
-def get_next_video() -> dict | None:
-    data = _get("/get-next-video", params={"client_id": CLIENT_ID})
-    if data.get("status") != "success":
-        LOG.info(f"No more videos: {data.get('message')}")
-        return None
-    return data
-
-
-def notify_completion(video_id: str, status: str, message: str = "",
-                      has_subtitle: bool | None = None,
-                      s3_audio: str | None = None,
-                      s3_subtitle: str | None = None) -> dict:
-    return _post("/notify-completion", {
-        "client_id": CLIENT_ID,
-        "video_id": video_id,
-        "status": status,
-        "message": message[:500] if message else "",
-        "has_subtitle": has_subtitle,
-        "s3_audio": s3_audio,
-        "s3_subtitle": s3_subtitle,
-    })
-
-
-def request_shutdown(reason: str):
-    try:
-        _post("/shutdown-request", {"client_id": CLIENT_ID, "reason": reason})
-    except Exception as e:
-        LOG.warning(f"shutdown request failed: {e}")
-
-
-def heartbeat_loop(stop_event: threading.Event):
-    while not stop_event.wait(60):
-        try:
-            _post("/heartbeat", {"client_id": CLIENT_ID}, timeout=10)
-        except Exception as e:
-            LOG.debug(f"heartbeat failed: {e}")
-
-
-# ---------- S3 helpers ----------
-def s3_client():
-    return boto3.client(
-        "s3",
-        aws_access_key_id=S3["access_key_id"],
-        aws_secret_access_key=S3["secret_access_key"],
-        region_name=S3["region"],
-    )
-
-
-def s3_object_exists(s3, key: str) -> bool:
-    try:
-        s3.head_object(Bucket=S3["bucket"], Key=key)
-        return True
-    except Exception:
-        return False
-
-
-def s3_upload(s3, path: str, key: str) -> str:
-    LOG.info(f"S3 upload → s3://{S3['bucket']}/{key}")
-    s3.upload_file(path, S3["bucket"], key)
-    return f"s3://{S3['bucket']}/{key}"
-
-
-def safe_name(s: str, n: int = 100) -> str:
-    return "".join(c if c.isalnum() or c in " -_()" else "_" for c in s)[:n].strip(" _-") or "untitled"
-
-
-# ---------- yt-dlp helpers ----------
+# ---------- yt-dlp common opts ----------
 YDL_COMMON = {
     "quiet": True,
     "no_warnings": True,
     "noplaylist": True,
     "no_check_certificate": True,
-    # `tv` and `mweb` often return DRM-protected manifests. The clients
-    # below give us audio URLs that are reliably non-DRM and rarely trip
-    # the cloud-IP bot check. `missing_pot` keeps formats when no
-    # proof-of-origin token can be derived.
     "extractor_args": {
         "youtube": {
             "player_client": ["web_safari", "android_vr", "ios",
@@ -201,9 +80,142 @@ YDL_COMMON = {
                       "Version/17.5 Safari/605.1.15",
     },
     "geo_bypass": True,
+    "socket_timeout": 30,
 }
 
 
+# ---------- API helpers ----------
+_session = requests.Session()
+
+
+def _post(path: str, json_body: dict, timeout: int = 30) -> dict:
+    r = _session.post(f"{API_BASE_URL}{path}", json=json_body, timeout=timeout,
+                      headers={"X-Client-Id": CLIENT_ID})
+    r.raise_for_status()
+    return r.json()
+
+
+def _get(path: str, params: dict | None = None, timeout: int = 30) -> dict:
+    r = _session.get(f"{API_BASE_URL}{path}", params=params or {}, timeout=timeout,
+                     headers={"X-Client-Id": CLIENT_ID})
+    r.raise_for_status()
+    return r.json()
+
+
+def register():
+    LOG.info(f"REGISTER as {CLIENT_ID} (vast={VAST_INSTANCE_ID})")
+    return _post("/register", {"instance_id": VAST_INSTANCE_ID or None})
+
+
+def fetch_config():
+    LOG.info("fetching config from orchestrator")
+    data = _get("/get-config")
+    cfg = data["config"]
+    aws = cfg["aws"]
+    S3.update({
+        "access_key_id": aws["access_key_id"],
+        "secret_access_key": aws["secret_access_key"],
+        "region": aws["region"],
+        "bucket": aws["s3_bucket"],
+        "prefix": aws.get("s3_prefix", ""),
+    })
+    LIMITS.update(cfg.get("limits", {}))
+    LOG.info(f"S3 bucket={S3['bucket']} workers={LIMITS['client_workers']} "
+             f"batch={LIMITS['client_batch_size']}")
+
+
+def fetch_cookies():
+    if not COOKIES_URL:
+        return
+    try:
+        if COOKIES_URL.startswith("s3://"):
+            no_scheme = COOKIES_URL[5:]
+            bucket, _, key = no_scheme.partition("/")
+            s3_client().download_file(bucket, key, COOKIES_FILE)
+        else:
+            r = _session.get(COOKIES_URL, timeout=30)
+            r.raise_for_status()
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(r.content)
+        YDL_COMMON["cookiefile"] = COOKIES_FILE
+        LOG.info(f"loaded cookies from {COOKIES_URL}")
+    except Exception as e:
+        LOG.warning(f"could not load cookies: {e}")
+
+
+def get_batch(n: int) -> list[dict]:
+    data = _get("/get-next-video-batch", params={"client_id": CLIENT_ID, "n": n})
+    if data.get("status") != "success":
+        return []
+    return data.get("videos", [])
+
+
+def notify_completion(video_id: str, status: str, message: str = "",
+                      has_subtitle: bool | None = None,
+                      s3_audio: str | None = None,
+                      s3_subtitle: str | None = None) -> dict:
+    return _post("/notify-completion", {
+        "client_id": CLIENT_ID, "video_id": video_id, "status": status,
+        "message": message[:500] if message else "",
+        "has_subtitle": has_subtitle,
+        "s3_audio": s3_audio, "s3_subtitle": s3_subtitle,
+    })
+
+
+def request_shutdown(reason: str):
+    try:
+        _post("/shutdown-request", {"client_id": CLIENT_ID, "reason": reason})
+    except Exception as e:
+        LOG.warning(f"shutdown request failed: {e}")
+
+
+def heartbeat_loop(stop: threading.Event):
+    while not stop.wait(30):
+        try:
+            _post("/heartbeat", {"client_id": CLIENT_ID}, timeout=10)
+        except Exception as e:
+            LOG.debug(f"heartbeat fail: {e}")
+
+
+# ---------- S3 ----------
+_s3_local = threading.local()
+
+
+def s3_client():
+    s = getattr(_s3_local, "s3", None)
+    if s is None:
+        s = boto3.client(
+            "s3",
+            aws_access_key_id=S3["access_key_id"],
+            aws_secret_access_key=S3["secret_access_key"],
+            region_name=S3["region"],
+        )
+        _s3_local.s3 = s
+    return s
+
+
+def s3_object_exists(s3, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=S3["bucket"], Key=key)
+        return True
+    except Exception:
+        return False
+
+
+def s3_upload(s3, path: str, key: str) -> str:
+    LOG.info(f"S3 UPLOAD start key={key} size={os.path.getsize(path)}")
+    t0 = time.time()
+    s3.upload_file(path, S3["bucket"], key)
+    LOG.info(f"S3 UPLOAD done  key={key} took={time.time()-t0:.1f}s")
+    return f"s3://{S3['bucket']}/{key}"
+
+
+def safe_name(s: str, n: int = 100) -> str:
+    return ("".join(c if c.isalnum() or c in " -_()" else "_" for c in s)[:n]
+            .strip(" _-") or "untitled")
+
+
+# ---------- yt-dlp helpers ----------
 def probe_video(url: str) -> dict:
     opts = {**YDL_COMMON, "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -211,7 +223,6 @@ def probe_video(url: str) -> dict:
 
 
 def pick_subtitle_lang(info: dict) -> str | None:
-    """Prefer manual subs, fall back to auto. Prefer tr → en → first."""
     manual = info.get("subtitles") or {}
     auto = info.get("automatic_captions") or {}
     candidates = list(manual.keys()) or list(auto.keys())
@@ -220,8 +231,6 @@ def pick_subtitle_lang(info: dict) -> str | None:
     for pref in ("tr", "en"):
         if pref in candidates:
             return pref
-    # any base language match (en-US -> en)
-    for pref in ("tr", "en"):
         for c in candidates:
             if c.startswith(pref):
                 return c
@@ -230,7 +239,6 @@ def pick_subtitle_lang(info: dict) -> str | None:
 
 def download_audio_and_subs(url: str, work_dir: str, video_title: str
                             ) -> tuple[str | None, str | None, bool]:
-    """Returns (audio_path, subtitle_path, had_subtitle_attempted)."""
     base = safe_name(video_title)
     output_template = os.path.join(work_dir, f"{base}.%(ext)s")
     wav_path = os.path.join(work_dir, f"{base}.wav")
@@ -238,19 +246,13 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
     info = probe_video(url)
     sub_lang = pick_subtitle_lang(info)
 
-    # 1. download audio (always). Filter out DRM-protected formats: many
-    # YouTube responses on cloud IPs include a Widevine track that yt-dlp
-    # cannot decrypt. `[protocol!=m3u8_native][has_drm=False]` keeps us on
-    # plain audio URLs.
     audio_opts = {
         **YDL_COMMON,
         "format": "bestaudio[has_drm=false]/bestaudio/best[has_drm=false]",
         "outtmpl": output_template,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
+        "postprocessors": [{"key": "FFmpegExtractAudio",
+                            "preferredcodec": "wav",
+                            "preferredquality": "192"}],
         "postprocessor_args": ["-ar", "16000"],
         "retries": 3,
         "fragment_retries": 3,
@@ -260,14 +262,12 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
         ydl.download([url])
 
     if not os.path.exists(wav_path):
-        # yt-dlp may have used a slightly different filename
         candidates = list(Path(work_dir).glob(f"{base}*.wav"))
         if candidates:
             wav_path = str(candidates[0])
         else:
             raise RuntimeError("audio file not produced")
 
-    # 2. try subtitle (best-effort)
     sub_path = None
     if sub_lang:
         sub_opts = {
@@ -287,16 +287,13 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
             if cands:
                 sub_path = str(cands[0])
         except Exception as e:
-            LOG.warning(f"subtitle download failed: {e}")
+            LOG.warning(f"subtitle dl failed for {url}: {e}")
 
     return wav_path, sub_path, sub_lang is not None
 
 
-# ---------- main per-video flow ----------
-def process_video(video: dict, s3) -> tuple[str, str, dict]:
-    """Return (status, message, extras). status is one of:
-    success | no_subtitle | exists | error
-    """
+def process_video_once(video: dict) -> tuple[str, str, dict]:
+    """Single-shot processing — returns (status, message, extras)."""
     url = video["video_url"]
     vtype = video.get("type", "default")
     work_dir = tempfile.mkdtemp(prefix="yt_")
@@ -310,6 +307,7 @@ def process_video(video: dict, s3) -> tuple[str, str, dict]:
         wav_key = f"{prefix}{vtype}/{ch}/{base}.wav"
         sub_key = f"{prefix}{vtype}/{ch}/{base}.srt"
 
+        s3 = s3_client()
         wav_exists = s3_object_exists(s3, wav_key)
         sub_exists = s3_object_exists(s3, sub_key)
         if wav_exists and sub_exists:
@@ -319,85 +317,68 @@ def process_video(video: dict, s3) -> tuple[str, str, dict]:
                 "has_subtitle": True,
             }
 
-        wav_path, sub_path, attempted_sub = download_audio_and_subs(url, work_dir, title)
+        wav_path, sub_path, _ = download_audio_and_subs(url, work_dir, title)
 
-        s3_audio = None
-        if not wav_exists:
-            s3_audio = s3_upload(s3, wav_path, wav_key)
-        else:
-            s3_audio = f"s3://{S3['bucket']}/{wav_key}"
-
+        s3_audio = (s3_upload(s3, wav_path, wav_key) if not wav_exists
+                    else f"s3://{S3['bucket']}/{wav_key}")
         s3_sub = None
-        if sub_path:
+        if sub_path and not sub_exists:
             s3_sub = s3_upload(s3, sub_path, sub_key)
+        elif sub_exists:
+            s3_sub = f"s3://{S3['bucket']}/{sub_key}"
+
+        if s3_sub:
             return "success", "ok", {"s3_audio": s3_audio, "s3_subtitle": s3_sub,
                                      "has_subtitle": True}
-        else:
-            # audio uploaded, no subtitle available
-            return "no_subtitle", "audio uploaded; no subtitle", {
-                "s3_audio": s3_audio, "s3_subtitle": None, "has_subtitle": False,
-            }
+        return "no_subtitle", "no subtitle available", {
+            "s3_audio": s3_audio, "s3_subtitle": None, "has_subtitle": False,
+        }
     finally:
-        try:
-            shutil.rmtree(work_dir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
-def process_video_with_retry(video: dict, s3, max_retries: int) -> tuple[str, str, dict]:
+def process_video_with_retry(video: dict) -> tuple[str, str, dict]:
     last_err = ""
-    for attempt in range(1, max_retries + 1):
+    for attempt in range(1, LIMITS["max_retries_same_video"] + 1):
         try:
-            LOG.info(f"[{attempt}/{max_retries}] processing {video['video_url']}")
-            return process_video(video, s3)
+            t0 = time.time()
+            LOG.info(f"DL  start [{attempt}/{LIMITS['max_retries_same_video']}] "
+                     f"video={video['video_id']} url={video['video_url']}")
+            status, msg, extras = process_video_once(video)
+            LOG.info(f"DL  done  video={video['video_id']} status={status} "
+                     f"took={time.time()-t0:.1f}s")
+            return status, msg, extras
         except Exception as e:
             last_err = str(e)
-            LOG.warning(f"attempt {attempt} failed: {e}")
+            LOG.warning(f"DL  fail  video={video['video_id']} attempt={attempt} "
+                        f"err={last_err[:200]}")
             time.sleep(min(2 ** attempt, 30) + random.uniform(0, 2))
     return "error", last_err, {}
 
 
-# ---------- top-level loop ----------
-def run():
-    if not API_BASE_URL:
-        LOG.error("API_BASE_URL is not set; cannot continue")
-        sys.exit(1)
+# ---------- worker model ----------
+class Pool:
+    def __init__(self, workers: int, batch_size: int):
+        self.workers = workers
+        self.batch_size = batch_size
+        self.queue: queue.Queue[dict] = queue.Queue(maxsize=workers * 2)
+        self.stop_event = threading.Event()
+        self.shutdown_requested = threading.Event()
+        self.completed_lock = threading.Lock()
+        self.completed_count = 0
+        self.failed_in_a_row = 0
 
-    # registration retry: orchestrator may not be reachable instantly
-    for i in range(20):
-        try:
-            register()
-            fetch_config()
-            break
-        except Exception as e:
-            LOG.warning(f"register failed (try {i+1}): {e}")
-            time.sleep(min(5 + i * 3, 60))
-    else:
-        LOG.error("Could not register with orchestrator — exiting")
-        sys.exit(2)
-
-    fetch_cookies()
-    s3 = s3_client()
-    consecutive_failures = 0
-    stop_hb = threading.Event()
-    threading.Thread(target=heartbeat_loop, args=(stop_hb,), daemon=True).start()
-
-    try:
-        while True:
+    def worker(self, idx: int):
+        threading.current_thread().name = f"w{idx}"
+        while not self.stop_event.is_set():
             try:
-                video = get_next_video()
-            except Exception as e:
-                LOG.warning(f"get-next-video failed: {e}")
-                time.sleep(15)
+                video = self.queue.get(timeout=1.0)
+            except queue.Empty:
                 continue
-
-            if video is None:
-                LOG.info("No more videos — exiting normally")
-                return
-
-            status, msg, extras = process_video_with_retry(
-                video, s3, max_retries=LIMITS["max_retries_same_video"]
-            )
+            try:
+                status, msg, extras = process_video_with_retry(video)
+            except Exception as e:
+                status, msg, extras = "error", str(e), {}
 
             try:
                 resp = notify_completion(
@@ -407,25 +388,102 @@ def run():
                     s3_subtitle=extras.get("s3_subtitle"),
                 )
             except Exception as e:
-                LOG.warning(f"notify_completion failed: {e}")
+                LOG.warning(f"notify fail: {e}")
                 resp = {}
 
-            if status == "error":
-                consecutive_failures += 1
-                LOG.warning(f"consecutive failures: {consecutive_failures}")
-                if (consecutive_failures >= LIMITS["max_consecutive_failures"]
-                        or resp.get("shutdown")):
-                    request_shutdown(
-                        f"{consecutive_failures} consecutive failures"
-                    )
-                    LOG.error("requesting shutdown — exiting")
-                    return
-            else:
-                consecutive_failures = 0
+            with self.completed_lock:
+                if status in ("success", "no_subtitle", "exists"):
+                    self.completed_count += 1
+                    self.failed_in_a_row = 0
+                else:
+                    self.failed_in_a_row += 1
 
-            time.sleep(random.uniform(0.5, 2.0))
+            if resp.get("shutdown"):
+                LOG.error(f"server requested shutdown: {resp.get('reason')}")
+                self.shutdown_requested.set()
+                self.stop_event.set()
+
+            self.queue.task_done()
+
+    def feeder(self):
+        threading.current_thread().name = "feeder"
+        idle_loops = 0
+        while not self.stop_event.is_set():
+            need = self.queue.maxsize - self.queue.qsize()
+            if need <= 0:
+                time.sleep(0.5)
+                continue
+            try:
+                videos = get_batch(min(self.batch_size, need))
+            except Exception as e:
+                LOG.warning(f"get_batch failed: {e}")
+                time.sleep(5)
+                continue
+            if not videos:
+                idle_loops += 1
+                if idle_loops > 10:  # ~10 * 5s = ~50s idle
+                    LOG.info("no more videos available — exiting")
+                    self.stop_event.set()
+                    return
+                time.sleep(5)
+                continue
+            idle_loops = 0
+            for v in videos:
+                LOG.info(f"GOT video={v['video_id']} url={v['video_url']} "
+                         f"type={v['type']}")
+                self.queue.put(v)
+
+
+def run():
+    if not API_BASE_URL:
+        LOG.error("API_BASE_URL is not set")
+        sys.exit(1)
+
+    for i in range(20):
+        try:
+            register()
+            fetch_config()
+            break
+        except Exception as e:
+            LOG.warning(f"register failed (try {i+1}): {e}")
+            time.sleep(min(5 + i * 3, 60))
+    else:
+        LOG.error("Could not register; exiting")
+        sys.exit(2)
+
+    fetch_cookies()
+
+    pool = Pool(workers=LIMITS["client_workers"],
+                batch_size=LIMITS["client_batch_size"])
+
+    stop_hb = threading.Event()
+    threading.Thread(target=heartbeat_loop, args=(stop_hb,),
+                     name="hb", daemon=True).start()
+
+    feeder = threading.Thread(target=pool.feeder, name="feeder", daemon=True)
+    feeder.start()
+
+    threads = []
+    for i in range(pool.workers):
+        t = threading.Thread(target=pool.worker, args=(i,), name=f"w{i}", daemon=True)
+        t.start()
+        threads.append(t)
+
+    LOG.info(f"started {pool.workers} workers")
+
+    try:
+        while not pool.stop_event.is_set():
+            time.sleep(2)
+    except KeyboardInterrupt:
+        pass
     finally:
+        pool.stop_event.set()
+        if pool.shutdown_requested.is_set():
+            request_shutdown("server requested shutdown")
         stop_hb.set()
+        for t in threads:
+            t.join(timeout=10)
+        LOG.info(f"client exiting (completed={pool.completed_count})")
 
 
 if __name__ == "__main__":
