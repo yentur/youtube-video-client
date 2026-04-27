@@ -158,19 +158,21 @@ YDL_COMMON = {
     "no_warnings": True,
     "noplaylist": True,
     "no_check_certificate": True,
-    # `mweb` + `tv` are the two clients that most reliably hand out playable
-    # stream URLs without a po_token on cloud IPs. `missing_pot` tells yt-dlp
-    # to keep formats even when the proof-of-origin token isn't available.
+    # `tv` and `mweb` often return DRM-protected manifests. The clients
+    # below give us audio URLs that are reliably non-DRM and rarely trip
+    # the cloud-IP bot check. `missing_pot` keeps formats when no
+    # proof-of-origin token can be derived.
     "extractor_args": {
         "youtube": {
-            "player_client": ["mweb", "tv", "web_safari", "ios"],
+            "player_client": ["web_safari", "android_vr", "ios",
+                              "web_creator", "tv_embedded"],
             "formats": "missing_pot",
         },
     },
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                      "Mobile/15E148 Safari/604.1",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                      "Version/17.5 Safari/605.1.15",
     },
     "geo_bypass": True,
 }
@@ -210,10 +212,13 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
     info = probe_video(url)
     sub_lang = pick_subtitle_lang(info)
 
-    # 1. download audio (always)
+    # 1. download audio (always). Filter out DRM-protected formats: many
+    # YouTube responses on cloud IPs include a Widevine track that yt-dlp
+    # cannot decrypt. `[protocol!=m3u8_native][has_drm=False]` keeps us on
+    # plain audio URLs.
     audio_opts = {
         **YDL_COMMON,
-        "format": "bestaudio/best",
+        "format": "bestaudio[has_drm=false]/bestaudio/best[has_drm=false]",
         "outtmpl": output_template,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
