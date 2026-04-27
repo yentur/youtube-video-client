@@ -1,44 +1,35 @@
-# youtube-video-client
+# YouTube Video Client
 
-Client component of the **vast-dataset** distributed YouTube downloader.
-Designed to run on an ephemeral Vast.ai instance and pull work from a
-central orchestrator.
+Per-link cycle worker for the **YT Dataset Orchestrator** (`https://github.com/yentur/youtube-video-client` / Vast.ai).
 
 ## What it does
+1. Registers with the orchestrator → receives AWS creds + rules.
+2. Loops:
+   - Asks for the next link (`GET /api/v1/get-link`).
+   - Downloads bestaudio + subtitles (any language) with `yt-dlp`.
+   - Uploads to S3:
+     - `s3://<bucket>/<prefix>/<type>/<channel>/<video_id>.<ext>` (audio)
+     - `s3://<bucket>/<prefix>/<type>/<channel>/<video_id>.srt`   (subtitle, if any)
+   - If the audio object already exists, it's skipped (idempotent).
+   - Reports completion to the orchestrator.
+3. Retries each link up to **5** times. After **3** consecutive distinct-link
+   failures it requests its own shutdown and exits with rc=42.
 
-1. Registers itself with the orchestrator (`API_BASE_URL`) using its
-   `CLIENT_ID`.
-2. Fetches AWS S3 credentials and limits from the orchestrator.
-3. In a loop:
-   - asks for the next YouTube link,
-   - downloads the audio (16 kHz WAV) with `yt-dlp`,
-   - downloads a subtitle if any is available (manual preferred, auto
-     fallback; tr → en → first language),
-   - uploads both files to `s3://<bucket>/<type>/<channel>/<title>.{wav,srt}`,
-   - reports the result back to the orchestrator.
-4. Retries the same link up to **5×** with exponential backoff. If
-   **3 different links fail in a row**, asks the orchestrator to destroy
-   this Vast instance and exits.
+## Required env
+| Variable           | Meaning                                                       |
+| ------------------ | ------------------------------------------------------------- |
+| `API_BASE_URL`     | Orchestrator URL, e.g. `http://1.2.3.4:8765`                   |
+| `CLIENT_ID`        | Stable client id (orchestrator sets this on rent)              |
+| `VAST_INSTANCE_ID` | Vast container id (optional, used for tracking)                |
+| `COOKIES_URL`      | Optional `s3://...` or `https://...` to a yt-dlp cookies file  |
 
-Skips silently if the file already exists in S3.
-
-## Required env vars
-
-| Variable           | Meaning                                       |
-| ------------------ | --------------------------------------------- |
-| `API_BASE_URL`     | Orchestrator URL, e.g. `http://1.2.3.4:8765` |
-| `CLIENT_ID`        | Orchestrator-assigned slot id (optional)      |
-| `VAST_INSTANCE_ID` | Vast container label (optional, best-effort)  |
-
-## Local run
-
+## Run locally (debug)
 ```bash
-python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-API_BASE_URL=http://localhost:8765 CLIENT_ID=dev python main.py
+API_BASE_URL=http://localhost:8765 CLIENT_ID=local-debug python3 main.py
 ```
 
-## On a Vast.ai box
-
-`entrypoint.sh` is the canonical onstart script — it installs deps, clones
-this repo, then runs `main.py` in a restart loop.
+## Exit codes
+- `0`  — work is done (server said all_done).
+- `42` — server requested shutdown OR self-decided (3 consecutive failures, idle).
+- `1`  — fatal error.
