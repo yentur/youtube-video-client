@@ -67,21 +67,41 @@ YDL_COMMON = {
     "no_warnings": True,
     "noplaylist": True,
     "no_check_certificate": True,
+    # `android_vr` + `tv_simply` give us audio URLs that are (a) playable
+    # without po_token and (b) usually NOT DRM-locked. The "web_*" clients
+    # often hand back URLs that 403 on download even though metadata
+    # extraction succeeds. `formats: missing_pot` keeps formats yt-dlp
+    # would otherwise drop because no proof-of-origin token was derived.
     "extractor_args": {
         "youtube": {
-            "player_client": ["web_safari", "android_vr", "ios",
-                              "web_creator", "tv_embedded"],
+            "player_client": ["android_vr", "tv_simply", "ios"],
             "formats": "missing_pot",
         },
     },
     "http_headers": {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                      "Version/17.5 Safari/605.1.15",
+        "User-Agent": "com.google.android.youtube/19.09.37 (Linux; U; Android 14)",
     },
     "geo_bypass": True,
     "socket_timeout": 30,
+    "force_ipv4": True,
 }
+
+
+# yt-dlp messages that mean "this URL is poisoned for us — retrying with
+# the same client/IP will not help". Bail out early on these instead of
+# burning 5 retries.
+FATAL_DOWNLOAD_ERRORS = (
+    "HTTP Error 403",
+    "Sign in to confirm",
+    "DRM protected",
+    "Video unavailable",
+    "Private video",
+    "members-only",
+    "removed by the uploader",
+    "country which is not available",
+    "Premieres",
+    "premiered",
+)
 
 
 # ---------- API helpers ----------
@@ -339,10 +359,11 @@ def process_video_once(video: dict) -> tuple[str, str, dict]:
 
 def process_video_with_retry(video: dict) -> tuple[str, str, dict]:
     last_err = ""
-    for attempt in range(1, LIMITS["max_retries_same_video"] + 1):
+    max_r = LIMITS["max_retries_same_video"]
+    for attempt in range(1, max_r + 1):
         try:
             t0 = time.time()
-            LOG.info(f"DL  start [{attempt}/{LIMITS['max_retries_same_video']}] "
+            LOG.info(f"DL  start [{attempt}/{max_r}] "
                      f"video={video['video_id']} url={video['video_url']}")
             status, msg, extras = process_video_once(video)
             LOG.info(f"DL  done  video={video['video_id']} status={status} "
@@ -350,8 +371,14 @@ def process_video_with_retry(video: dict) -> tuple[str, str, dict]:
             return status, msg, extras
         except Exception as e:
             last_err = str(e)
-            LOG.warning(f"DL  fail  video={video['video_id']} attempt={attempt} "
+            fatal = any(m in last_err for m in FATAL_DOWNLOAD_ERRORS)
+            LOG.warning(f"DL  fail  video={video['video_id']} attempt={attempt}"
+                        f"{' fatal' if fatal else ''} "
                         f"err={last_err[:200]}")
+            if fatal:
+                # No point retrying with the same player_client list — let
+                # another machine (different IP) take a swing at it.
+                return "error", last_err, {}
             time.sleep(min(2 ** attempt, 30) + random.uniform(0, 2))
     return "error", last_err, {}
 
