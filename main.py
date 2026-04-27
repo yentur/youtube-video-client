@@ -153,8 +153,29 @@ def safe_name(s: str, n: int = 100) -> str:
 
 
 # ---------- yt-dlp helpers ----------
+YDL_COMMON = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "no_check_certificate": True,
+    # Cycle through clients that don't trip the "are you a bot" check on
+    # cloud IPs. tv_simply + web_safari + ios is the most reliable combo
+    # as of late-2025 yt-dlp builds.
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["tv_simply", "web_safari", "ios", "android_vr"],
+        },
+    },
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                      "Version/17.0 Safari/605.1.15",
+    },
+}
+
+
 def probe_video(url: str) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    opts = {**YDL_COMMON, "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
@@ -189,6 +210,7 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
 
     # 1. download audio (always)
     audio_opts = {
+        **YDL_COMMON,
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "postprocessors": [{
@@ -197,8 +219,6 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
             "preferredquality": "192",
         }],
         "postprocessor_args": ["-ar", "16000"],
-        "quiet": True,
-        "noplaylist": True,
         "retries": 3,
         "fragment_retries": 3,
         "concurrent_fragment_downloads": 4,
@@ -218,14 +238,13 @@ def download_audio_and_subs(url: str, work_dir: str, video_title: str
     sub_path = None
     if sub_lang:
         sub_opts = {
+            **YDL_COMMON,
             "skip_download": True,
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitleslangs": [sub_lang],
             "subtitlesformat": "srt",
             "outtmpl": output_template,
-            "quiet": True,
-            "noplaylist": True,
         }
         try:
             with yt_dlp.YoutubeDL(sub_opts) as ydl:
